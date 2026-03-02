@@ -32,7 +32,6 @@ def serialize(doc) -> dict:
             doc[field] = doc[field].isoformat()
     return doc
 
-
 def get_storage_layer(selected_datetime: datetime):
     now = datetime.now(timezone.utc)
     if selected_datetime.tzinfo is None:

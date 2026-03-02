@@ -181,7 +181,7 @@ def simulate_vehicle(vehicle_id: str):
         # Never go below ambient
         temperature = round(max(AMBIENT_TEMP, min(temperature, profile["max_temp"])), 2)
 
-        # ── Fuel — decreases based on speed and running time
+       #-Fuel
         fuel_consumption_per_second = (profile["fuel_per_hour"] / 3600) * (0.3 + 0.7 * (speed / max_speed))
         fuel_level = max(0, fuel_level - fuel_consumption_per_second)
         fuel_level = round(fuel_level, 3)

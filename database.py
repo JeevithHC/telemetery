@@ -11,6 +11,7 @@ import os
 
 load_dotenv()
 
+
 username = "telemetry_user"
 password = quote_plus("Jjsvbba@2024")  
 

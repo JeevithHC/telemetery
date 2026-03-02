@@ -78,6 +78,5 @@ def downsample():
 
     print(f"\n[{datetime.now()}] Done.")
 
-
 if __name__ == "__main__":
     downsample()

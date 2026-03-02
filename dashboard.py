@@ -444,6 +444,7 @@ st.sidebar.markdown("""
 📦 Permanent → yearly *(forever)*
 """)
 
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 **Physics Model**
