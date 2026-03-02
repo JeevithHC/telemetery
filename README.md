@@ -208,6 +208,9 @@ crontab -e
 ## 👤 Author
 
 **Shamantak** — Led the overall project from conception to delivery — overseeing project planning, sprint organization, and technical direction. Contributed directly to backend development and produced the core research documentation.
+
 **Bhoomi** — Front-end Designer, looked after the interactice stream-lit Interface - including real-time data binding, storage layer routing, fleet summary views, live telemetry charts, and the authenticated user interface.
+
 **Joyster** — Engineered the full-stack integration between the backend API and the Streamlit frontend dashboard, realistic physics-based vehicle simulator .
+
 **Jeevith** — Built as part of a backend systems and IoT data engineering project, FastAPI REST API with 5-tier hot-cold storage architecture, MongoDB Atlas database design, and the automated downsampling pipeline.
