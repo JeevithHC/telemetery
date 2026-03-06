@@ -1,0 +1,6 @@
+PS D:\telemetry\files> streamlit run dashboard.py
+  You can now view your Streamlit app in your browser.
+  Local URL: http://localhost:8501
+  Network URL: http://10.15.129.199:8501
+C:\Users\JOYSTER PINTO\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\__init__.py:109: RequestsDependencyWarning: urllib3 (2.5.0) or chardet (7.0.1)/charset_normalizer (3.4.3) doesn't match a supported version!
+  warnings.warn(

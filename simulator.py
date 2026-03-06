@@ -1,248 +1,452 @@
 """
-Vehicle Telemetry Simulator — Realistic Physics Model
-------------------------------------------------------
-Each vehicle tracks:
-- running_hours: how long it has been running (increments every second)
-- speed:         realistic acceleration/deceleration over time
-- rpm:           directly correlated with speed + vehicle type
-- temperature:   rises with running hours AND speed (cools when idle)
-- fuel_level:    decreases based on speed + running load
-- battery_level: slow drain over time
-- timestamp:     UTC timestamp of each reading
+simulator.py — Realistic Vehicle Telemetry Simulator v2
+=========================================================
+Fleet : SCOOTY x10, BIKE x10, CAR x20, PICKUP x10,
+        VAN x15, TRUCK x20, BUS x15  =  100 vehicles
+Data  : 35+ fields per second per vehicle
+Physics: speed drives RPM and temperature, fuel drains
+         with load, tyres slowly leak, oil degrades
+
+Windows: runs as-is — no changes needed.
+         Start with:  python simulator.py
 """
 
 import requests
 import random
 import time
 import threading
+import math
 from datetime import datetime, timezone
 
-# ── Config ─────────────────────────────────────────────────
 API_URL       = "http://localhost:8000/api/telemetry"
-SEND_INTERVAL = 1  # seconds between readings
+SEND_INTERVAL = 1  # seconds between sends per vehicle
 
-VEHICLES = [f"TRUCK-{i:03d}" for i in range(1, 51)] + \
-           [f"CAR-{i:03d}"   for i in range(1, 26)] + \
-           [f"VAN-{i:03d}"   for i in range(1, 26)]
-
+# ── Fleet Definition ───────────────────────────────────────
+VEHICLES = (
+    [f"SCOOTY-{i:03d}" for i in range(1, 11)] +
+    [f"BIKE-{i:03d}"   for i in range(1, 11)] +
+    [f"CAR-{i:03d}"    for i in range(1, 21)] +
+    [f"PICKUP-{i:03d}" for i in range(1, 11)] +
+    [f"VAN-{i:03d}"    for i in range(1, 16)] +
+    [f"TRUCK-{i:03d}"  for i in range(1, 21)] +
+    [f"BUS-{i:03d}"    for i in range(1, 16)]
+)
 random.shuffle(VEHICLES)
-# ──────────────────────────────────────────────────────────
 
+# ── Chennai GPS Bounds ─────────────────────────────────────
+GPS_BOUNDS = {
+    "lat_min": 12.92, "lat_max": 13.18,
+    "lon_min": 80.12, "lon_max": 80.27   # 80.27 keeps vehicles west of coastline
+}
 
-# ── Vehicle Type Profiles ──────────────────────────────────
+# ── Vehicle Profiles ───────────────────────────────────────
 PROFILES = {
-    "TRUCK": {
-        "max_speed":       100,   # km/h
-        "idle_rpm":        750,
-        "max_rpm":         2500,
-        "base_temp":       75,    # °C when cold
-        "max_temp":        115,   # °C at full load for hours
-        "temp_per_hour":   8,     # °C added per running hour
-        "temp_per_speed":  0.15,  # °C added per km/h
-        "fuel_capacity":   300,   # litres
-        "fuel_per_hour":   120,   # scaled up for demo visibility
-        "battery_start":   100,
-        "battery_drain":   0.02   # % per second — visible in ~83 mins
+    "SCOOTY": {
+        "max_speed": 60,    "idle_rpm": 1200, "max_rpm": 7000,
+        "base_temp": 55,    "max_temp": 95,   "temp_per_hour": 4,  "temp_per_speed": 0.07,
+        "fuel_capacity": 5, "fuel_per_hour": 10, "battery_drain": 0.020,
+        "has_turbo": False, "has_clutch": True, "max_clutch_shifts": 8,
+        "load_capable": False, "two_wheeler": True,
+        "normal_oil_psi": 35, "normal_coolant": 65,
+        "tyre_psi_front": 30, "tyre_psi_rear": 28,
+        "max_vibration": 4,   "normal_voltage": 13.8, "max_load_kg": 0,
+    },
+    "BIKE": {
+        "max_speed": 120,   "idle_rpm": 1000, "max_rpm": 9000,
+        "base_temp": 60,    "max_temp": 100,  "temp_per_hour": 5,  "temp_per_speed": 0.09,
+        "fuel_capacity": 15,"fuel_per_hour": 18, "battery_drain": 0.020,
+        "has_turbo": False, "has_clutch": True, "max_clutch_shifts": 12,
+        "load_capable": False, "two_wheeler": True,
+        "normal_oil_psi": 40, "normal_coolant": 70,
+        "tyre_psi_front": 32, "tyre_psi_rear": 30,
+        "max_vibration": 5,   "normal_voltage": 13.8, "max_load_kg": 0,
     },
     "CAR": {
-        "max_speed":       140,
-        "idle_rpm":        700,
-        "max_rpm":         4500,
-        "base_temp":       70,
-        "max_temp":        105,
-        "temp_per_hour":   6,
-        "temp_per_speed":  0.10,
-        "fuel_capacity":   50,
-        "fuel_per_hour":   60,
-        "battery_start":   100,
-        "battery_drain":   0.015
+        "max_speed": 140,   "idle_rpm": 700,  "max_rpm": 5000,
+        "base_temp": 70,    "max_temp": 105,  "temp_per_hour": 6,  "temp_per_speed": 0.10,
+        "fuel_capacity": 50,"fuel_per_hour": 60, "battery_drain": 0.015,
+        "has_turbo": False, "has_clutch": True, "max_clutch_shifts": 6,
+        "load_capable": False, "two_wheeler": False,
+        "normal_oil_psi": 55, "normal_coolant": 88,
+        "tyre_psi_front": 32, "tyre_psi_rear": 32,
+        "max_vibration": 4,   "normal_voltage": 14.2, "max_load_kg": 0,
+    },
+    "PICKUP": {
+        "max_speed": 130,   "idle_rpm": 750,  "max_rpm": 4000,
+        "base_temp": 75,    "max_temp": 110,  "temp_per_hour": 7,  "temp_per_speed": 0.12,
+        "fuel_capacity": 80,"fuel_per_hour": 80, "battery_drain": 0.015,
+        "has_turbo": True,  "has_clutch": True, "max_clutch_shifts": 7,
+        "load_capable": True, "two_wheeler": False,
+        "normal_oil_psi": 60, "normal_coolant": 90,
+        "tyre_psi_front": 35, "tyre_psi_rear": 38,
+        "max_vibration": 5,   "normal_voltage": 14.2, "max_load_kg": 1000,
     },
     "VAN": {
-        "max_speed":       120,
-        "idle_rpm":        750,
-        "max_rpm":         3500,
-        "base_temp":       72,
-        "max_temp":        110,
-        "temp_per_hour":   7,
-        "temp_per_speed":  0.12,
-        "fuel_capacity":   80,
-        "fuel_per_hour":   90,
-        "battery_start":   100,
-        "battery_drain":   0.018
-    }
+        "max_speed": 120,   "idle_rpm": 750,  "max_rpm": 3500,
+        "base_temp": 72,    "max_temp": 110,  "temp_per_hour": 7,  "temp_per_speed": 0.12,
+        "fuel_capacity": 80,"fuel_per_hour": 90, "battery_drain": 0.018,
+        "has_turbo": True,  "has_clutch": True, "max_clutch_shifts": 6,
+        "load_capable": True, "two_wheeler": False,
+        "normal_oil_psi": 60, "normal_coolant": 90,
+        "tyre_psi_front": 38, "tyre_psi_rear": 42,
+        "max_vibration": 5,   "normal_voltage": 14.2, "max_load_kg": 1500,
+    },
+    "TRUCK": {
+        "max_speed": 100,    "idle_rpm": 750,  "max_rpm": 2500,
+        "base_temp": 75,     "max_temp": 115,  "temp_per_hour": 8,  "temp_per_speed": 0.15,
+        "fuel_capacity": 300,"fuel_per_hour": 120, "battery_drain": 0.020,
+        "has_turbo": True,   "has_clutch": True, "max_clutch_shifts": 5,
+        "load_capable": True, "two_wheeler": False,
+        "normal_oil_psi": 65, "normal_coolant": 92,
+        "tyre_psi_front": 100,"tyre_psi_rear": 110,
+        "max_vibration": 7,   "normal_voltage": 14.4, "max_load_kg": 10000,
+    },
+    "BUS": {
+        "max_speed": 90,     "idle_rpm": 700,  "max_rpm": 2200,
+        "base_temp": 78,     "max_temp": 118,  "temp_per_hour": 9,  "temp_per_speed": 0.16,
+        "fuel_capacity": 250,"fuel_per_hour": 150, "battery_drain": 0.025,
+        "has_turbo": True,   "has_clutch": True, "max_clutch_shifts": 4,
+        "load_capable": True, "two_wheeler": False,
+        "normal_oil_psi": 68, "normal_coolant": 93,
+        "tyre_psi_front": 100,"tyre_psi_rear": 110,
+        "max_vibration": 8,   "normal_voltage": 14.4, "max_load_kg": 8000,
+    },
 }
 
 
-def get_profile(vehicle_id: str) -> dict:
-    if "TRUCK" in vehicle_id:
-        return PROFILES["TRUCK"]
-    elif "CAR" in vehicle_id:
-        return PROFILES["CAR"]
-    else:
-        return PROFILES["VAN"]
+def get_type(vid: str) -> str:
+    for t in ["SCOOTY","BIKE","CAR","PICKUP","VAN","TRUCK","BUS"]:
+        if t in vid:
+            return t
+    return "CAR"
+
+
+def calc_driver_safety_score(harsh_braking, harsh_accel, clutch_shifts,
+                              brake_pressure, steering_angle, max_clutch):
+    score = 100.0
+    if harsh_braking:                      score -= 15
+    if harsh_accel:                        score -= 12
+    if clutch_shifts > max_clutch * 0.8:  score -= 8
+    if brake_pressure > 85:               score -= 5
+    if abs(steering_angle) > 35:          score -= 5
+    return round(max(0, score), 1)
+
+
+def calc_health_score(oil_psi, normal_oil, vibration, max_vib,
+                      tyre_pressures, normal_tyre_f, normal_tyre_r,
+                      odometer, coolant, normal_coolant):
+    score = 100.0
+    # Oil pressure
+    oil_ratio = oil_psi / normal_oil
+    if oil_ratio < 0.5:    score -= 30
+    elif oil_ratio < 0.7:  score -= 15
+    elif oil_ratio < 0.85: score -= 5
+    # Vibration
+    vib_ratio = vibration / max_vib
+    if vib_ratio > 0.85:   score -= 20
+    elif vib_ratio > 0.7:  score -= 10
+    # Tyres
+    normals = [normal_tyre_f, normal_tyre_f, normal_tyre_r, normal_tyre_r]
+    for tp, n in zip(tyre_pressures, normals):
+        dev = abs(tp - n) / n
+        if dev > 0.2:   score -= 8
+        elif dev > 0.1: score -= 3
+    # Odometer wear
+    if odometer > 150000:   score -= 15
+    elif odometer > 100000: score -= 8
+    elif odometer > 50000:  score -= 3
+    # Coolant
+    if coolant > normal_coolant * 1.15: score -= 10
+    return round(max(0, min(100, score)), 1)
 
 
 def simulate_vehicle(vehicle_id: str):
-    """Simulate a single vehicle with realistic correlated telemetry."""
-
-    profile = get_profile(vehicle_id)
+    vtype   = get_type(vehicle_id)
+    profile = PROFILES[vtype]
 
     # ── Initial State ──────────────────────────────────────
     running_seconds = 0
     speed           = 0.0
+    temperature     = 25.0      # cold start — ambient temp
+    coolant_temp    = 25.0
     fuel_level      = float(profile["fuel_capacity"])
-    battery_level   = float(profile["battery_start"])
-    temperature     = 25.0  # starts at ambient (cold engine)
+    battery_level   = 100.0
+    odometer        = random.uniform(5000, 80000)
+    mode            = random.choice(["city","highway","idle"])
+    mode_timer      = 0
+    mode_duration   = random.randint(30, 120)
+    target_speed    = 0.0
+    heading         = random.uniform(0, 360)
+    lat             = random.uniform(GPS_BOUNDS["lat_min"]+0.05, GPS_BOUNDS["lat_max"]-0.05)
+    lon             = random.uniform(GPS_BOUNDS["lon_min"]+0.05, GPS_BOUNDS["lon_max"]-0.05)
 
-    # Each vehicle starts with a random driving mode
-    mode              = random.choice(["city", "highway", "idle"])
-    mode_duration     = random.randint(30, 120)  # seconds to stay in this mode
-    mode_timer        = 0
-    target_speed      = 0.0
+    # Tyres start slightly below normal (realistic)
+    tyre_fl = profile["tyre_psi_front"] - random.uniform(0, 2)
+    tyre_fr = profile["tyre_psi_front"] - random.uniform(0, 2)
+    tyre_rl = profile["tyre_psi_rear"]  - random.uniform(0, 2)
+    tyre_rr = profile["tyre_psi_rear"]  - random.uniform(0, 2)
 
-    print(f"[START] {vehicle_id} — mode: {mode}")
+    oil_pressure    = profile["normal_oil_psi"] - random.uniform(0, 3)
+    load_weight_pct = random.uniform(20, 90) if profile["load_capable"] else 0.0
+
+    print(f"[START] {vehicle_id} ({vtype}) | mode={mode} | lat={lat:.4f} lon={lon:.4f}")
 
     while True:
         running_hours = running_seconds / 3600.0
+        max_speed     = profile["max_speed"]
         timestamp     = datetime.now(timezone.utc)
 
-        max_speed = profile["max_speed"]
-
-        # ── Mode switching — stay in mode for realistic duration ──
+        # ── Mode switching ─────────────────────────────────
         mode_timer += 1
         if mode_timer >= mode_duration:
-            # Pick next mode with weighted probability
             mode = random.choices(
-                ["city", "highway", "idle", "braking"],
+                ["city","highway","idle","braking"],
                 weights=[40, 35, 15, 10]
             )[0]
             mode_timer    = 0
-            mode_duration = random.randint(30, 120)  # next mode lasts 30–120 seconds
+            mode_duration = random.randint(30, 120)
 
-        # ── Set target speed based on mode ─────────────────
+        # ── Target speed per mode ──────────────────────────
         if mode == "highway":
-            # Pick a consistent highway cruise speed for this phase
             if mode_timer == 0:
                 target_speed = random.uniform(max_speed * 0.70, max_speed * 0.95)
         elif mode == "city":
-            # Occasionally vary city speed (stop-start traffic)
             if mode_timer == 0 or mode_timer % 15 == 0:
-                target_speed = random.uniform(10, max_speed * 0.45)
+                target_speed = random.uniform(5, max_speed * 0.45)
         elif mode == "idle":
             target_speed = 0
         elif mode == "braking":
             target_speed = max(0, speed - random.uniform(3, 10))
 
-        # ── Smooth acceleration/deceleration ───────────────
-        # Gradual change toward target — no instant jumps
+        # ── Smooth speed transitions ───────────────────────
         if speed < target_speed:
-            accel = random.uniform(0.5, 2.0)  # gentle acceleration
-            speed = min(speed + accel, target_speed)
+            speed = min(speed + random.uniform(0.5, 2.5), target_speed)
         elif speed > target_speed:
-            decel = random.uniform(1.0, 4.0)  # braking
-            speed = max(speed - decel, target_speed)
-
+            speed = max(speed - random.uniform(1.0, 4.0), target_speed)
         speed = round(max(0.0, min(speed, max_speed)), 2)
 
-        # ── RPM — directly tracks speed smoothly ───────────
+        # ── RPM — correlated with speed ────────────────────
         idle_rpm = profile["idle_rpm"]
         max_rpm  = profile["max_rpm"]
-
         if speed == 0:
-            # Idling — small fluctuation around idle RPM
-            rpm = round(random.uniform(idle_rpm - 50, idle_rpm + 100), 0)
+            rpm = round(random.uniform(idle_rpm - 50, idle_rpm + 150), 0)
         else:
             speed_ratio = speed / max_speed
-            # RPM rises proportionally with speed
-            base_rpm = idle_rpm + (max_rpm - idle_rpm) * speed_ratio
-            # Small variance for gear changes (±100 RPM max)
-            rpm = round(base_rpm + random.uniform(-100, 100), 0)
+            rpm = idle_rpm + (max_rpm - idle_rpm) * speed_ratio
+            rpm = round(rpm + random.uniform(-100, 100), 0)
             rpm = max(idle_rpm, min(rpm, max_rpm))
 
-        # ── Temperature — cold start + hours + speed ───────
-        AMBIENT_TEMP = 25.0
-        hour_heat    = profile["temp_per_hour"] * running_hours
-        speed_heat   = profile["temp_per_speed"] * speed
-        target_temp  = AMBIENT_TEMP + hour_heat + speed_heat
-
-        # Only add noise after engine is warmed up
+        # ── Temperature — physics model ────────────────────
+        AMBIENT     = 32.0   # Chennai ambient
+        hour_heat   = profile["temp_per_hour"]  * running_hours
+        speed_heat  = profile["temp_per_speed"] * speed
+        load_heat   = (load_weight_pct / 100) * 5 if profile["load_capable"] else 0
+        target_temp = AMBIENT + hour_heat + speed_heat + load_heat
         if running_hours > 0.05:
             target_temp += random.uniform(-1.0, 1.0)
-
-        # Cap at max operating temp
         target_temp = min(target_temp, profile["max_temp"])
 
-        # Temperature moves gradually toward target (thermal inertia)
         if temperature < target_temp:
             temperature += random.uniform(0.1, 0.5)
         elif temperature > target_temp:
             temperature -= random.uniform(0.05, 0.2)
+        temperature = round(max(AMBIENT, min(temperature, profile["max_temp"])), 2)
 
-        # Never go below ambient
-        temperature = round(max(AMBIENT_TEMP, min(temperature, profile["max_temp"])), 2)
+        # ── Coolant temperature ────────────────────────────
+        target_coolant = profile["normal_coolant"] * (temperature / (profile["max_temp"] * 0.8))
+        target_coolant = min(target_coolant, profile["normal_coolant"] * 1.2)
+        if coolant_temp < target_coolant:
+            coolant_temp += random.uniform(0.05, 0.3)
+        elif coolant_temp > target_coolant:
+            coolant_temp -= random.uniform(0.02, 0.15)
+        coolant_temp = round(max(AMBIENT, coolant_temp), 2)
 
-       #-Fuel
-        fuel_consumption_per_second = (profile["fuel_per_hour"] / 3600) * (0.3 + 0.7 * (speed / max_speed))
-        fuel_level = max(0, fuel_level - fuel_consumption_per_second)
-        fuel_level = round(fuel_level, 3)
+        # ── Oil Pressure — degrades with hours + RPM ───────
+        oil_drain    = 0.0001 * running_hours + (rpm / max_rpm) * 0.001
+        oil_pressure = max(10, oil_pressure - oil_drain + random.uniform(-0.1, 0.15))
+        oil_pressure = round(min(oil_pressure, profile["normal_oil_psi"]), 2)
 
-        # Convert to percentage
-        fuel_pct = round((fuel_level / profile["fuel_capacity"]) * 100, 2)
+        # ── Engine Vibration ───────────────────────────────
+        age_factor   = min(odometer / 100000, 1.0)
+        rpm_factor   = abs(rpm - (idle_rpm + (max_rpm - idle_rpm) * 0.5)) / max_rpm
+        vibration    = round(age_factor * 2 + rpm_factor * profile["max_vibration"] + random.uniform(0, 0.5), 2)
+        vibration    = min(vibration, profile["max_vibration"])
 
-        # ── Battery — slow drain over time ─────────────────
-        battery_level = max(0, battery_level - profile["battery_drain"])
-        battery_level = round(battery_level, 3)
+        # ── Turbo Boost ────────────────────────────────────
+        if profile["has_turbo"]:
+            turbo_boost = round((speed / max_speed) * 18 + random.uniform(-1, 1), 2) if speed > 30 else 0.0
+        else:
+            turbo_boost = 0.0
 
-        # ── Build payload ──────────────────────────────────
+        # ── Alternator Voltage ─────────────────────────────
+        alternator_voltage = round(
+            profile["normal_voltage"] + random.uniform(-0.3, 0.2) - (battery_level < 30) * 0.5, 2
+        )
+
+        # ── Fuel consumption ───────────────────────────────
+        load_factor  = 1 + (load_weight_pct / 100) * 0.3 if profile["load_capable"] else 1.0
+        fuel_per_sec = (profile["fuel_per_hour"] / 3600) * (0.3 + 0.7 * (speed / max_speed)) * load_factor
+        fuel_level   = max(0, fuel_level - fuel_per_sec)
+        fuel_pct     = round((fuel_level / profile["fuel_capacity"]) * 100, 2)
+
+        # ── Battery drain ──────────────────────────────────
+        battery_level = round(max(0, battery_level - profile["battery_drain"]), 3)
+
+        # ── Tyre pressure — slow leak ──────────────────────
+        tyre_fl = round(max(10, tyre_fl - random.uniform(0, 0.003)), 3)
+        tyre_fr = round(max(10, tyre_fr - random.uniform(0, 0.003)), 3)
+        tyre_rl = round(max(10, tyre_rl - random.uniform(0, 0.002)), 3)
+        tyre_rr = round(max(10, tyre_rr - random.uniform(0, 0.002)), 3)
+
+        # ── Odometer ───────────────────────────────────────
+        odometer = round(odometer + (speed / 3600), 3)
+
+        # ── Driver Behavior ────────────────────────────────
+        if speed == 0:
+            accel_pct      = 0.0
+            brake_pressure = round(random.uniform(0, 5), 1)
+        elif mode == "braking":
+            accel_pct      = 0.0
+            brake_pressure = round(random.uniform(40, 95), 1)
+        else:
+            accel_pct      = round((speed / max_speed) * 100 + random.uniform(-5, 5), 1)
+            accel_pct      = max(0, min(100, accel_pct))
+            brake_pressure = round(random.uniform(0, 15), 1)
+
+        if not profile["has_clutch"] or speed == 0:
+            clutch_shifts = 0
+        elif mode == "city":
+            clutch_shifts = round(random.uniform(2, profile["max_clutch_shifts"]), 1)
+        elif mode == "highway":
+            clutch_shifts = round(random.uniform(0, 1.5), 1)
+        else:
+            clutch_shifts = round(random.uniform(0, profile["max_clutch_shifts"] * 0.4), 1)
+
+        if mode == "city":
+            steering_angle = round(random.uniform(-40, 40), 1)
+        elif mode == "highway":
+            steering_angle = round(random.uniform(-8, 8), 1)
+        else:
+            steering_angle = 0.0
+
+        harsh_braking      = brake_pressure > 80
+        harsh_acceleration = accel_pct > 88 and mode != "braking"
+
+        # ── GPS Movement ───────────────────────────────────
+        heading += random.uniform(-5, 5)
+        heading  = heading % 360
+
+        if speed > 0:
+            speed_km_per_sec = speed / 3600
+            lat += (speed_km_per_sec / 111) * math.cos(math.radians(heading))
+            lon += (speed_km_per_sec / (111 * math.cos(math.radians(lat)))) * math.sin(math.radians(heading))
+
+        if lat < GPS_BOUNDS["lat_min"] or lat > GPS_BOUNDS["lat_max"]:
+            heading = (180 - heading) % 360
+            lat = max(GPS_BOUNDS["lat_min"], min(GPS_BOUNDS["lat_max"], lat))
+        if lon < GPS_BOUNDS["lon_min"] or lon > GPS_BOUNDS["lon_max"]:
+            heading = (360 - heading) % 360
+            lon = max(GPS_BOUNDS["lon_min"], min(GPS_BOUNDS["lon_max"], lon))
+
+        gps_signal     = round(random.uniform(75, 100), 1)
+        ambient_temp   = round(AMBIENT + random.uniform(-2, 2), 1)
+        headwind_speed = round(random.uniform(0, 30), 1)
+
+        # ── Derived Scores ─────────────────────────────────
+        driver_safety_score = calc_driver_safety_score(
+            harsh_braking, harsh_acceleration, clutch_shifts,
+            brake_pressure, steering_angle, profile["max_clutch_shifts"]
+        )
+        health_score = calc_health_score(
+            oil_pressure, profile["normal_oil_psi"],
+            vibration, profile["max_vibration"],
+            [tyre_fl, tyre_fr, tyre_rl, tyre_rr],
+            profile["tyre_psi_front"], profile["tyre_psi_rear"],
+            odometer, coolant_temp, profile["normal_coolant"]
+        )
+        maintenance_required = health_score < 40
+
+        # ── Build Payload ──────────────────────────────────
         payload = {
-            "vehicle_id":     vehicle_id,
-            "timestamp":      timestamp.isoformat(),
-            "running_hours":  round(running_hours, 4),
-            "speed":          speed,
-            "rpm":            rpm,
-            "temperature":    temperature,
-            "fuel_level":     fuel_pct,
-            "battery_level":  battery_level,
-            "driving_mode":   mode
+            "vehicle_id":   vehicle_id,
+            "vehicle_type": vtype,
+            "timestamp":    timestamp.isoformat(),
+            "data_type":    "raw",
+            # Location
+            "latitude":          round(lat, 6),
+            "longitude":         round(lon, 6),
+            "heading":           round(heading, 1),
+            "gps_signal":        gps_signal,
+            # Core
+            "speed":             speed,
+            "rpm":               rpm,
+            "driving_mode":      mode,
+            "running_hours":     round(running_hours, 4),
+            "odometer":          round(odometer, 1),
+            # Thermal
+            "engine_temp":       temperature,
+            "coolant_temp":      coolant_temp,
+            "ambient_temp":      ambient_temp,
+            # Engine Health
+            "oil_pressure":      round(oil_pressure, 2),
+            "engine_vibration":  round(vibration, 2),
+            "turbo_boost":       turbo_boost,
+            "alternator_voltage":alternator_voltage,
+            # Driver
+            "brake_pressure":        brake_pressure,
+            "accelerator_pct":       accel_pct,
+            "clutch_shifts_per_min": clutch_shifts,
+            "steering_angle":        steering_angle,
+            "harsh_braking":         harsh_braking,
+            "harsh_acceleration":    harsh_acceleration,
+            # Load & Wear
+            "load_weight_pct":   round(load_weight_pct, 1),
+            "tyre_pressure_fl":  tyre_fl,
+            "tyre_pressure_fr":  tyre_fr,
+            "tyre_pressure_rl":  tyre_rl,
+            "tyre_pressure_rr":  tyre_rr,
+            # Resources
+            "fuel_level":        fuel_pct,
+            "battery_level":     round(battery_level, 2),
+            # Environment
+            "headwind_speed":    headwind_speed,
+            # Derived
+            "driver_safety_score": driver_safety_score,
+            "health_score":        health_score,
+            "maintenance_required":maintenance_required,
         }
 
         # ── Send to API ────────────────────────────────────
         try:
-            response = requests.post(API_URL, json=payload, timeout=5)
-
-            if response.status_code == 201:
-                print(f"[OK] {vehicle_id} | "
-                      f"{running_hours:.2f}h | "
-                      f"speed={speed} km/h | "
-                      f"rpm={rpm:.0f} | "
-                      f"temp={temperature}°C | "
-                      f"fuel={fuel_pct}% | "
-                      f"mode={mode}")
+            r = requests.post(API_URL, json=payload, timeout=5)
+            if r.status_code == 201:
+                maint = " MAINT!" if maintenance_required else ""
+                print(
+                    f"[{vehicle_id}] {running_hours:.2f}h | "
+                    f"{speed}km/h | {rpm:.0f}rpm | "
+                    f"eng={temperature}C | fuel={fuel_pct}% | "
+                    f"health={health_score}{maint}"
+                )
             else:
-                print(f"[WARN] {vehicle_id} → {response.status_code}")
-
-        except requests.exceptions.ConnectionError:
-            print(f"[ERROR] {vehicle_id} → Cannot connect to API.")
-        except requests.exceptions.Timeout:
-            print(f"[ERROR] {vehicle_id} → Timeout.")
+                print(f"[WARN] {vehicle_id} -> {r.status_code}")
+        except Exception as e:
+            print(f"[ERROR] {vehicle_id} -> {e}")
 
         running_seconds += SEND_INTERVAL
         time.sleep(SEND_INTERVAL)
 
 
 def main():
-    print("=" * 60)
-    print("   Vehicle Telemetry Simulator — Realistic Physics Model")
-    print(f"   {len(VEHICLES)} vehicles | {SEND_INTERVAL}s interval")
-    print("=" * 60)
+    print("=" * 65)
+    print("   Vehicle Telemetry Simulator v2 - Full Physics Model")
+    print(f"   {len(VEHICLES)} vehicles | GPS: Chennai | {SEND_INTERVAL}s interval")
+    print("=" * 65)
     print("Press CTRL+C to stop.\n")
 
-    threads = []
-    for vehicle_id in VEHICLES:
-        t = threading.Thread(target=simulate_vehicle, args=(vehicle_id,), daemon=True)
-        threads.append(t)
+    for vid in VEHICLES:
+        t = threading.Thread(target=simulate_vehicle, args=(vid,), daemon=True)
         t.start()
-        time.sleep(0.05)
+        time.sleep(0.05)   # slight stagger to avoid all threads hitting API at once
 
     try:
         while True:
